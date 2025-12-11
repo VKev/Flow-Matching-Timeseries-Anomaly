@@ -54,7 +54,7 @@ def parse_args():
     parser.add_argument(
         "--dataset",
         type=str,
-        default="smd",
+        default="ecg",
         choices=["smd", "ucr", "gesture2d", "pd", "ecg"],
         help="Dataset to use: smd, ucr, gesture2d, pd, or ecg",
     )
@@ -82,7 +82,7 @@ def parse_args():
     parser.add_argument("--win-size", type=int, default=100, help="Sliding window size")
     parser.add_argument("--step", type=int, default=1, help="Stride for sliding window")
 
-    parser.add_argument("--batch-size", type=int, default=256, help="Train batch size")
+    parser.add_argument("--batch-size", type=int, default=32, help="Train batch size")
     parser.add_argument(
         "--test-batch-size",
         type=int,

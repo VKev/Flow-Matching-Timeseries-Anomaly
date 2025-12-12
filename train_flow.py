@@ -33,6 +33,81 @@ from flow_matching.solver import ODESolver
 LOG_2PI = math.log(2 * math.pi)
 
 
+def compute_anomaly_scores(
+    terminal: torch.Tensor,
+    method: str = "r2_z",
+    k: int = 3,
+    latent_stats: dict | None = None,
+) -> torch.Tensor:
+    """
+    Compute anomaly scores from terminal latent states.
+
+    terminal: [B, L, D] or [B, L] or [B, D] or [L, D]
+    method:
+        - "nll_mean":     mean NLL over dims (original default)
+        - "r2":           squared L2 norm ||z||^2
+        - "r2_z":         dimension-normalized radius ((||z||^2 - D) / sqrt(2D))
+        - "mahalanobis":  Mahalanobis distance squared using latent_stats["mean"] and latent_stats["cov_inv"]
+        - "max_nll":      max per-dim NLL (channel-sensitive)
+        - "topk_nll":     mean NLL of top-k dims (channel-sensitive)
+
+    Returns: scores of shape [B, L]
+    """
+
+    # --------- Normalize shape to [B, L, D] ---------
+    if terminal.dim() == 1:
+        terminal = terminal.view(1, 1, -1)          # [D] -> [1, 1, D]
+    elif terminal.dim() == 2:
+        terminal = terminal.unsqueeze(-1)           # [B, L] -> [B, L, 1]
+    elif terminal.dim() == 3:
+        pass
+    else:
+        raise ValueError(f"Unexpected terminal shape: {terminal.shape}")
+
+    B, L, D = terminal.shape
+
+    # Common NLL tensor for N(0,1): 0.5 * (z^2 + log 2π), shape [B, L, D]
+    nll = 0.5 * (terminal ** 2 + LOG_2PI)
+
+    if method == "nll_mean":
+        scores = nll.mean(dim=-1)  # [B, L]
+
+    elif method == "r2":
+        scores = (terminal ** 2).sum(dim=-1)  # [B, L]
+
+    elif method == "r2_z":
+        r2 = (terminal ** 2).sum(dim=-1)
+        mean_r2 = float(D)
+        std_r2 = math.sqrt(2.0 * D)
+        scores = (r2 - mean_r2) / std_r2
+
+    elif method == "mahalanobis":
+        if latent_stats is None:
+            raise ValueError("latent_stats must be provided for method='mahalanobis'.")
+        mu = latent_stats.get("mean", None)
+        cov_inv = latent_stats.get("cov_inv", None)
+        if mu is None or cov_inv is None:
+            raise ValueError("latent_stats['mean'] and latent_stats['cov_inv'] must be set.")
+        mu = mu.to(terminal.device)
+        cov_inv = cov_inv.to(terminal.device)
+        delta = terminal - mu.view(1, 1, D)
+        tmp = torch.matmul(delta, cov_inv)  # [B, L, D]
+        scores = (tmp * delta).sum(dim=-1)
+
+    elif method == "max_nll":
+        scores = nll.max(dim=-1).values
+
+    elif method == "topk_nll":
+        k = max(1, min(k, D))
+        topk_vals, _ = nll.topk(k, dim=-1)
+        scores = topk_vals.mean(dim=-1)
+
+    else:
+        raise ValueError(f"Unknown scoring method: {method}")
+
+    return scores
+
+
 def set_seed(seed: int = 64, deterministic: bool = False):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -54,7 +129,7 @@ def parse_args():
     parser.add_argument(
         "--dataset",
         type=str,
-        default="ecg",
+        default="smd",
         choices=["smd", "ucr", "gesture2d", "pd", "ecg"],
         help="Dataset to use: smd, ucr, gesture2d, pd, or ecg",
     )
@@ -99,6 +174,12 @@ def parse_args():
     )
     parser.add_argument("--nhead", type=int, default=8, help="Number of attention heads")
     parser.add_argument("--num-layers", type=int, default=6, help="Number of transformer layers")
+    parser.add_argument(
+        "--latent-dim",
+        type=int,
+        default=None,
+        help="Optional latent dimension for model output; defaults to input_dim when None.",
+    )
 
     parser.add_argument("--epochs", type=int, default=50, help="Training epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
@@ -127,6 +208,19 @@ def parse_args():
         type=str,
         default="euler",
         help="torchdiffeq ODE solver method (default: euler).",
+    )
+    parser.add_argument(
+        "--score-method",
+        type=str,
+        default="mahalanobis",
+        choices=["nll_mean", "r2", "r2_z", "mahalanobis", "max_nll", "topk_nll"],
+        help="Anomaly score aggregation over channels.",
+    )
+    parser.add_argument(
+        "--score-topk",
+        type=int,
+        default=3,
+        help="k for topk_nll scoring (ignored otherwise).",
     )
     return parser.parse_args()
 
@@ -289,7 +383,7 @@ def train_epoch_flow(model, prob_path, dataloader, optimizer, device, epoch, tot
     return total_loss / max(num_batches, 1)
 
 
-def evaluate_flow(model, test_loader, test_dataset, device, ode_step_size, ode_method):
+def evaluate_flow(model, test_loader, test_dataset, device, ode_step_size, ode_method, score_method, score_topk):
     """
     Evaluate via ODE integration from data (t=0) to the normal target (t=1).
     Anomaly score: mean negative log-likelihood under N(0,1) of the terminal state.
@@ -301,20 +395,15 @@ def evaluate_flow(model, test_loader, test_dataset, device, ode_step_size, ode_m
     win_size = test_dataset.win_size
     step = test_dataset.step
 
-    point_err_sum = np.zeros(T, dtype=np.float64)
-    point_err_count = np.zeros(T, dtype=np.float64)
-
     time_grid = torch.tensor([0.0, 1.0], device=device)
-    window_idx = 0
 
+    # First pass: collect terminal latents on CPU
+    terminals = []
     with torch.no_grad():
-        for windows, _ in tqdm(
-            test_loader, desc="Testing", leave=False, dynamic_ncols=True
-        ):
+        for windows, _ in tqdm(test_loader, desc="Testing (collect)", leave=False, dynamic_ncols=True):
             windows = windows.to(device)
             if windows.dim() == 2:
                 windows = windows.unsqueeze(-1)
-
             terminal = solver.sample(
                 x_init=windows,
                 step_size=ode_step_size,
@@ -322,36 +411,51 @@ def evaluate_flow(model, test_loader, test_dataset, device, ode_step_size, ode_m
                 time_grid=time_grid,
                 return_intermediates=False,
             )
-            if terminal.dim() == 2:
-                terminal = terminal.unsqueeze(-1)
+            terminals.append(terminal.cpu())
 
-            nll = 0.5 * (terminal ** 2 + LOG_2PI)
-            if nll.dim() == 3:
-                scores = nll.mean(dim=-1)
+    latent_stats = None
+    if score_method == "mahalanobis":
+        flat = torch.cat([t.reshape(-1, t.shape[-1]) for t in terminals], dim=0)
+        mu = flat.mean(dim=0)
+        xm = flat - mu
+        cov = (xm.T @ xm) / max(flat.shape[0] - 1, 1)
+        cov = cov + 1e-6 * torch.eye(cov.shape[0])
+        cov_inv = torch.linalg.pinv(cov)
+        latent_stats = {"mean": mu, "cov_inv": cov_inv}
+
+    point_err_sum = np.zeros(T, dtype=np.float64)
+    point_err_count = np.zeros(T, dtype=np.float64)
+    window_idx = 0
+
+    # Second pass: score and aggregate
+    for terminal in tqdm(terminals, desc="Testing (score)", leave=False, dynamic_ncols=True):
+        scores = compute_anomaly_scores(
+            terminal=terminal,
+            method=score_method,
+            k=score_topk,
+            latent_stats=latent_stats,
+        )
+        scores_np = scores.numpy()
+        batch_size = scores_np.shape[0]
+
+        for b in range(batch_size):
+            idx = window_idx + b
+            start = idx * step
+            end = start + win_size
+
+            if start >= T:
+                continue
+
+            if end > T:
+                end = T
+                err_window = scores_np[b, : end - start]
             else:
-                scores = nll
+                err_window = scores_np[b]
 
-            scores_np = scores.cpu().numpy()
-            batch_size = scores_np.shape[0]
+            point_err_sum[start:end] += err_window
+            point_err_count[start:end] += 1
 
-            for b in range(batch_size):
-                idx = window_idx + b
-                start = idx * step
-                end = start + win_size
-
-                if start >= T:
-                    continue
-
-                if end > T:
-                    end = T
-                    err_window = scores_np[b, : end - start]
-                else:
-                    err_window = scores_np[b]
-
-                point_err_sum[start:end] += err_window
-                point_err_count[start:end] += 1
-
-            window_idx += batch_size
+        window_idx += batch_size
 
     point_scores = np.zeros(T, dtype=np.float64)
     valid_mask = point_err_count > 0
@@ -392,6 +496,8 @@ def main():
         f"Train windows: {len(train_dataset)}, Test windows: {len(test_dataset)} "
         f"| Timeline length: {test_dataset.test.shape[0]}"
     )
+    # Persist input_dim so checkpoints can rebuild the model correctly.
+    args.input_dim = input_dim
     if args.dataset == "ucr":
         print(
             f"UCR id: {args.ucr_id} | train=UCR_train (normal only if train labels exist) | test=UCR_test"
@@ -404,6 +510,7 @@ def main():
         num_layers=args.num_layers,
         dim_feedforward=args.dim_feedforward,
         max_len=args.win_size,
+        latent_dim=args.latent_dim,
     ).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
@@ -422,7 +529,10 @@ def main():
     else:
         subdir = args.dataset
     os.makedirs(os.path.join(args.output_dir, subdir), exist_ok=True)
-    save_path = os.path.join(args.output_dir, subdir, args.save_name)
+    base_name, ext = os.path.splitext(args.save_name)
+    if not ext:
+        ext = ".pth"
+    save_path = os.path.join(args.output_dir, subdir, base_name + ext)
 
     print("Starting flow matching training...")
     for epoch in range(1, args.epochs + 1):
@@ -439,6 +549,8 @@ def main():
                 device,
                 args.ode_step_size,
                 args.ode_method,
+                args.score_method,
+                args.score_topk,
             )
 
             if best_point:
@@ -474,6 +586,20 @@ def main():
                     f"TP={tp}, FP={fp}, FN={fn}, TN={tn} | "
                     f"GT pos: {tp+fn} | Pred pos: {best_pa['pred_sum']}"
                 )
+
+        checkpoint_path = os.path.join(
+            args.output_dir, subdir, f"{base_name}_epoch{epoch}{ext}"
+        )
+        torch.save(
+            {
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "args": vars(args),
+            },
+            checkpoint_path,
+        )
+        print(f"Saved checkpoint: {checkpoint_path}")
 
     torch.save(
         {

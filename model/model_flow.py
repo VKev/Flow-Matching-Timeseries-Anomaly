@@ -67,12 +67,14 @@ class FlowMatchingTransformer(nn.Module):
         num_layers: int = 6,
         dim_feedforward: int = 512,
         max_len: int = 512,
+        latent_dim: int | None = None,
     ):
         super().__init__()
         if d_model < 2:
             raise ValueError("d_model must be at least 2 to build embeddings.")
 
         self.d_model = d_model
+        self.latent_dim = latent_dim or input_dim
         self.input_proj = nn.Linear(input_dim, d_model)
         self.register_buffer(
             "pos_enc", self._build_pos_enc(max_len, d_model), persistent=False
@@ -93,7 +95,12 @@ class FlowMatchingTransformer(nn.Module):
             activation=F.silu,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # Velocity in input space for ODE consistency
         self.output_proj = nn.Linear(d_model, input_dim)
+        # Optional latent projection head
+        self.latent_proj = None
+        if self.latent_dim != input_dim:
+            self.latent_proj = nn.Linear(d_model, self.latent_dim)
 
     def _build_pos_enc(self, max_len: int, d_model: int) -> torch.Tensor:
         position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
@@ -141,36 +148,35 @@ class FlowMatchingTransformer(nn.Module):
         velocity = self.output_proj(hidden)
         return velocity
 
+    def latent(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        Get latent projection (if configured); otherwise returns velocity projection.
+        """
+        hidden = self._encode_only(x, t)
+        if self.latent_proj is not None:
+            return self.latent_proj(hidden)
+        return self.output_proj(hidden)
 
+    def _encode_only(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2:
+            x = x.unsqueeze(-1)
+        if x.dim() != 3:
+            raise ValueError(f"Expected input of shape (B, T, C), got {x.shape}")
 
-class tAPE(nn.Module):
-    r"""Inject some information about the relative or absolute position of the tokens
-        in the sequence. The positional encodings have the same dimension as
-        the embeddings, so that the two can be summed. Here, we use sine and cosine
-        functions of different frequencies.
-    .. math::
-        \text{PosEncoder}(pos, 2i) = sin(pos/10000^(2i/d_model))
-        \text{PosEncoder}(pos, 2i+1) = cos(pos/10000^(2i/d_model))
-        \text{where pos is the word position and i is the embed idx)
-    Args:
-        d_model: the embed dim (required).
-        dropout: the dropout value (default=0.1).
-        max_len: the max. length of the incoming sequence (default=1024).
-    """
+        batch_size, seq_len, _ = x.shape
 
-    def __init__(self, d_model, dropout=0.1, max_len=1024, scale_factor=1.0):
-        super(tAPE, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        pe = torch.zeros(max_len, d_model)  # positional encoding
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        t = t.to(device=x.device, dtype=x.dtype)
+        if t.dim() == 0:
+            t = t.expand(batch_size)
+        elif t.dim() == 1 and t.numel() == 1 and batch_size > 1:
+            t = t.expand(batch_size)
+        elif t.dim() != 1 or t.shape[0] != batch_size:
+            raise ValueError(f"Time input shape mismatch: got {t.shape}, batch={batch_size}")
 
-        pe[:, 0::2] = torch.sin((position * div_term)*(d_model/max_len))
-        pe[:, 1::2] = torch.cos((position * div_term)*(d_model/max_len))
-        pe = scale_factor * pe.unsqueeze(0)
-        self.register_buffer('pe', pe)  # this stores the variable in the state_dict (used for non-trainable variables)
+        pos = self.pos_enc[:, :seq_len, :].to(x.device)
+        tokens = self.input_proj(x) + pos
 
-    def forward(self, x):
-        B, T, D = x.shape
-        pe = self.pe[:, :T].to(x.device, x.dtype)
-        return self.dropout(x + pe)
+        t_emb = self.time_mlp(self.time_embed(t))
+        tokens = tokens + t_emb[:, None, :]
+
+        return self.transformer(tokens)

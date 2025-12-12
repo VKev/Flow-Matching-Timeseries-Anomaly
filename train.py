@@ -13,6 +13,7 @@ from model.dataset.ucr import UCRSegLoader
 from model.dataset.gesture2d import Gesture2DSegLoader
 from model.dataset.pd import PDSegLoader
 from model.dataset.ecg import ECGSegLoader
+from model.dataset.msl import MSLSegLoader
 from model.metric import binary_classification_metrics
 from model.model import Transformer
 
@@ -44,8 +45,8 @@ def parse_args():
         "--dataset",
         type=str,
         default="smd",
-        choices=["smd", "ucr", "gesture2d", "pd", "ecg"],
-        help="Dataset to use: smd, ucr, gesture2d, pd, or ecg",
+        choices=["smd", "ucr", "gesture2d", "pd", "ecg", "msl"],
+        help="Dataset to use: smd, ucr, gesture2d, pd, ecg, or msl",
     )
     parser.add_argument(
         "--ucr-id",
@@ -320,6 +321,9 @@ def build_dataloaders(args):
     elif args.dataset == "ecg":
         data_source = os.path.join(args.data_root, f"ECG_{args.ecg_id}")
         dataset_cls = ECGSegLoader
+    elif args.dataset == "msl":
+        data_source = os.path.join(args.data_root, "msl")
+        dataset_cls = MSLSegLoader
     else:
         raise ValueError(f"Unsupported dataset: {args.dataset}")
 
@@ -426,6 +430,8 @@ def main():
         subdir = "pd"
     elif args.dataset == "ecg":
         subdir = f"ECG_{args.ecg_id}"
+    elif args.dataset == "msl":
+        subdir = "msl"
     else:
         subdir = args.dataset
     os.makedirs(os.path.join(args.output_dir, subdir), exist_ok=True)
